@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mood Paper</title>
+  <link rel="stylesheet" href="app.css">
+  <style>
+    #builder { display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+    #view { width: min(100%, 1280px); height: auto; }
+    #thumbs { display: grid; gap: 8px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); width: min(100%, 1280px); }
+    #thumbs .t { background: var(--raised); border-radius: 6px; padding: 6px; cursor: pointer; font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: .05em; }
+    #thumbs .t:hover { background: var(--line); }
+    #thumbs .t.on { color: var(--accent); background: var(--line); }
+    #thumbs canvas { width: 100%; margin-bottom: 4px; }
+    #gallery table { border-spacing: 6px; }
+    #gallery th { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--text2); text-align: left; font-weight: 600; }
+    #gallery td canvas { width: 240px; cursor: pointer; }
+    #gallery td canvas:hover { outline: 2px solid var(--accent); }
+    #fps { font: 11px var(--mono); color: var(--muted); align-self: center; }
+    header nav a { cursor: pointer; }
+    .gwrap { overflow-x: auto; }
+
+    /* phones and narrow windows: one column that scrolls as a page, the scene first, its controls under it */
+    @media (max-width: 760px) {
+      html, body { height: auto; }
+      header { height: auto; flex-wrap: wrap; gap: 8px 12px; padding: 8px 16px; position: sticky; top: 0; z-index: 2; }
+      header .tools { margin-left: auto; }
+      main { flex-direction: column; }
+      #stage { order: 1; overflow: visible; padding: 12px 16px; }
+      #panel { order: 2; width: auto; overflow: visible; padding: 4px 16px 24px; }
+      .row { grid-template-columns: 96px 1fr 38px; }
+      .row.wide { grid-template-columns: 96px 1fr; }
+      input[type=range] { height: 28px; }
+      select { padding: 8px; }
+      button { padding: 9px 14px; }
+      #thumbs { display: flex; overflow-x: auto; scroll-snap-type: x proximity; }  /* one swipeable strip, so the controls stay close */
+      #thumbs .t { flex: 0 0 140px; scroll-snap-align: start; }
+      /* gallery: swipe sideways, palette names pinned on the left */
+      #gallery td canvas { width: 160px; max-width: none; }
+      #gallery tr > th:first-child { position: sticky; left: 0; z-index: 1; background: var(--base); padding-right: 6px; max-width: 64px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Mood Paper</h1>
+    <nav><a data-view="builder">Builder</a><a data-view="gallery">Gallery</a></nav>
+    <div class="tools"><span id="fps"></span></div>
+  </header>
+  <main>
+    <aside id="panel"></aside>
+    <section id="stage">
+      <div id="builder">
+        <canvas id="view"></canvas>
+        <div id="thumbs"></div>
+      </div>
+      <div id="gallery" hidden>
+        <p class="hint">Every scene preset with every reference palette, at the builder's seed. Tap or click one to open it in the builder.</p>
+        <div class="gwrap"><table id="tbl"></table></div>
+      </div>
+    </section>
+  </main>
+
+  <script src="src/rng.js"></script>
+  <script src="src/color.js"></script>
+  <script src="src/noise.js"></script>
+  <script src="src/mood.js"></script>
+  <script src="src/refs.js"></script>
+  <script src="src/raster.js"></script>
+  <script src="src/shapes.js"></script>
+  <script src="src/scene.js"></script>
+  <script src="src/ui.js"></script>
+  <script src="src/panel.js"></script>
+  <script src="lib/gif.js"></script>
+  <script>
+    /**
+     * Mood Paper in one page: the scene builder (palette + preset + seed -> layered wallpaper, seamless loop, PNG / GIF
+     * export) and the gallery (every preset x every reference palette; a click loads that one into the builder).
+     * URL hash: palette | preset,seed,pixel size,view.
+     */
+    const $view = document.getElementById('view');
+    const $fps = document.getElementById('fps');
+    const SIZES = { '960x540': [960, 540], '1280x720': [1280, 720], '1920x1080': [1920, 1080], '2560x1440': [2560, 1440], '1080x1920 (phone)': [1080, 1920] };
+    const opt = { preset: 'peaks', seed: 1, size: '1280x720', px: 4, animate: false, period: 30, gifFps: 12, view: 'builder' };
+
+    function frame(t=0, target=$view, o=opt) {
+      const [w, h] = SIZES[o.size];
+      Scene.render(target, { preset: o.preset, palette: PalettePanel.palette, seed: o.seed, t, width: w, height: h, px: o.px });
+    }
+
+    //#region [ Thumbnails ]
+    const thumbs = {};
+    function buildThumbs() {
+      const $t = document.getElementById('thumbs');
+      for(const p of Scene.PRESETS) {
+        const $d = UI.el('div', 't');
+        const $c = UI.el('canvas');
+        $d.append($c, document.createTextNode(p));
+        $d.onclick = () => { presetCtl.set(p); markThumb(); start = 0; frame(); PalettePanel.writeHash(); };
+        $t.appendChild($d);
+        thumbs[p] = { $d, $c };
+      }
+    }
+    function markThumb() { for(const [p, { $d }] of Object.entries(thumbs)) $d.classList.toggle('on', p === opt.preset); }
+    function drawThumbs() {
+      for(const [p, { $c }] of Object.entries(thumbs))
+        Scene.render($c, { preset: p, palette: PalettePanel.palette, seed: opt.seed, width: 384, height: 216, px: 2 });
+    }
+    //#endregion
+
+    //#region [ Gallery ]
+    /** Preset x reference-palette matrix, drawn a row at a time (the page stays responsive), redrawn when the seed changed. */
+    const $tbl = document.getElementById('tbl');
+    let galleryFor = null, galleryJob = 0;
+    async function drawGallery() {
+      if(galleryFor === opt.seed) return;
+      galleryFor = opt.seed;
+      const job = ++galleryJob, seed = opt.seed;
+      const refs = Object.keys(REFS).filter(k => REFS[k].kind === 'wallpaper');
+      $tbl.replaceChildren();
+      $tbl.insertRow().innerHTML = '<th></th>' + Scene.PRESETS.map(p => `<th>${p}</th>`).join('');
+      for(const ref of refs) {
+        const est = Mood.estimate(REFS[ref].colors, REFS[ref].share), pal = Mood.generate(est);
+        const $row = $tbl.insertRow();
+        $row.innerHTML = `<th>${ref}</th>`;
+        for(const preset of Scene.PRESETS) {
+          const $c = UI.el('canvas');
+          Scene.render($c, { preset, palette: pal, seed, width: 480, height: 270, px: 2 });
+          $c.title = `${preset} / ${ref}`;
+          $c.onclick = () => openInBuilder(ref, est, preset);
+          $row.insertCell().appendChild($c);
+        }
+        await new Promise(r => setTimeout(r));
+        if(job !== galleryJob) return;  // a newer pass took over
+      }
+    }
+
+    function openInBuilder(ref, est, preset) {
+      PalettePanel.ctl.count.set(est.count);
+      PalettePanel.ctl.ref.set(ref);
+      presetCtl.set(preset);
+      markThumb();
+      show('builder');
+      PalettePanel.fromRef();  // sets the mood inputs and redraws
+    }
+    //#endregion
+
+    //#region [ Views ]
+    const $panel = document.getElementById('panel'), $builder = document.getElementById('builder'), $gallery = document.getElementById('gallery');
+    function show(view) {
+      opt.view = view;
+      $builder.hidden = view !== 'builder';
+      $gallery.hidden = view !== 'gallery';
+      $panel.hidden = view !== 'builder';
+      document.querySelectorAll('header nav a').forEach($a => $a.classList.toggle('on', $a.dataset.view === view));
+      document.querySelectorAll('header .tools button').forEach($b => $b.hidden = view !== 'builder');
+      if(view === 'gallery') drawGallery();
+      else if(!opt.animate) frame();
+      PalettePanel.writeHash();
+    }
+    document.querySelectorAll('header nav a').forEach($a => $a.onclick = () => show($a.dataset.view));
+    //#endregion
+
+    //#region [ Animation ]
+    let start = 0, frames = 0, last = 0;
+    function loop(now) {
+      if(!opt.animate) return;
+      if(!start) start = last = now;
+      if(opt.view === 'builder') frame(((now - start) / 1000 / opt.period) % 1);
+      frames++;
+      if(now - last > 1000) { $fps.textContent = opt.view === 'builder'? `${frames} fps`: ''; frames = 0; last = now; }
+      requestAnimationFrame(loop);
+    }
+    //#endregion
+
+    function redraw() { if(!opt.animate) frame(); drawThumbs(); }
+    PalettePanel.extraHash = () => `|${opt.preset},${opt.seed},${opt.px},${opt.view}`;
+    PalettePanel.onchange.push(redraw);
+    buildThumbs();
+    PalettePanel.init();
+    if(PalettePanel.hashExtra) {
+      const [p, s, px, v] = PalettePanel.hashExtra.split(',');  // older links carry a dither mode as the 4th field: ignored
+      Object.assign(opt, { preset: Scene.PRESETS.includes(p)? p: opt.preset, seed: +s || 1, px: +px || opt.px, view: v === 'gallery'? 'gallery': 'builder' });
+    }
+
+    UI.section('Scene');
+    const presetCtl = { set: p => { opt.preset = p; } };  // the preset is picked from the example thumbnails
+    const seedCtl = UI.slider(opt, 'seed', 'Seed', 1, 999, 1, () => { redraw(); PalettePanel.writeHash(); });
+    UI.select(opt, 'size', 'Size', Object.keys(SIZES), () => frame());
+    UI.section('Render');
+    UI.slider(opt, 'px', 'Pixel size', 1, 8, 1, () => { frame(); PalettePanel.writeHash(); });
+    UI.check(opt, 'animate', 'Animate (seamless loop)', on => { start = 0; $fps.textContent = ''; on? requestAnimationFrame(loop): frame(); });
+    UI.slider(opt, 'period', 'Loop (s)', 6, 60, 1);
+    UI.slider(opt, 'gifFps', 'GIF fps', 6, 24, 1);
+    UI.section('Shuffle');
+    const $sh = UI.el('div');
+    $sh.style.display = 'flex'; $sh.style.gap = '6px'; $sh.style.flexWrap = 'wrap';
+    UI.$panel.appendChild($sh);
+    UI.button('New seed', () => { seedCtl.set(Math.floor(Math.random() * 999) + 1); redraw(); PalettePanel.writeHash(); }, $sh);
+    UI.button('Random mood', () => {
+      const r = Math.random;
+      PalettePanel.ctl.mood.set(+r().toFixed(2));
+      PalettePanel.ctl.brightness.set(+r().toFixed(2));
+      PalettePanel.ctl.primary.set(Color.lch(0.45, 0.12, r() * 360));
+      PalettePanel.ctl.secondary.set(Color.lch(0.75, 0.13, r() * 360));
+      PalettePanel.manual = null;
+      PalettePanel.update();
+    }, $sh);
+    UI.button('Everything', () => {
+      presetCtl.set(Scene.PRESETS[Math.floor(Math.random() * Scene.PRESETS.length)]);
+      const refs = Object.keys(REFS).filter(k => REFS[k].kind === 'wallpaper');
+      PalettePanel.ctl.ref.set(refs[Math.floor(Math.random() * refs.length)]);
+      PalettePanel.fromRef();
+      seedCtl.set(Math.floor(Math.random() * 999) + 1);
+      markThumb(); redraw();
+    }, $sh);
+
+    UI.button('Export PNG', () => {
+      const out = document.createElement('canvas');
+      frame(0, out);
+      UI.download(out, `moodpaper-${opt.preset}-${opt.seed}.png`);
+    }, null, 'primary');
+
+    //#region [ GIF export ]
+    /** Renders one full loop at half size (max 240 frames) and saves it as a looping GIF. */
+    const $gif = UI.button('Export GIF', async () => {
+      const [w, h] = SIZES[opt.size];
+      const gw = Math.round(w / 2), gh = Math.round(h / 2), gpx = Math.max(1, Math.round(opt.px / 2));
+      const n = Math.min(240, Math.round(opt.period * opt.gifFps));
+      const c = document.createElement('canvas'), frames = [];
+      for(let i = 0; i < n; i++) {
+        Scene.render(c, { preset: opt.preset, palette: PalettePanel.palette, seed: opt.seed, t: i / n, width: gw, height: gh, px: gpx });
+        frames.push({ rgba: c.getContext('2d').getImageData(0, 0, c.width, c.height).data, delay: 1000 / opt.gifFps * (opt.period * opt.gifFps / n) });
+        if(i % 10 === 0) { $gif.textContent = `GIF ${Math.round(i / n * 100)}%`; await new Promise(r => setTimeout(r)); }
+      }
+      $gif.textContent = 'Encoding...';
+      await new Promise(r => setTimeout(r));
+      const bytes = DAE.Gif.encode({ w: c.width, h: c.height, frames });
+      const $a = UI.el('a');
+      $a.href = URL.createObjectURL(new Blob([bytes], { type: 'image/gif' }));
+      $a.download = `moodpaper-${opt.preset}-${opt.seed}.gif`;
+      $a.click();
+      $gif.textContent = 'Export GIF';
+    });
+    //#endregion
+
+    markThumb();
+    drawThumbs();
+    show(opt.view);
+  </script>
+</body>
+</html>
